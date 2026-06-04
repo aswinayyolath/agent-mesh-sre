@@ -49,6 +49,7 @@ export type AgentStatus =
   | "reasoning"
   | "acting"
   | "awaiting-approval"
+  | "learning"
   | "crashed"
   | "replaying";
 
@@ -326,6 +327,7 @@ export interface AgentSummaryPayload {
   slackMessage: string;
   itsmTicket: string;
   approvedBy: string | null;
+  liveEvents?: Array<{ type: string; agent: string; summary: string; ts: number }>;
 }
 
 export type EmailResult =

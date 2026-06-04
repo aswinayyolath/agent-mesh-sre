@@ -5,7 +5,7 @@ import type {
   AgentState, BrokerState, MralPhase, ApprovalRequest,
   AuditRecord, LessonRecord, NotificationRecord, BusEvent,
 } from "@/lib/types";
-import { runClientScenario, type ScenarioKey, type SimAction } from "@/lib/client-sim";
+import { runClientScenario, resolvePendingApproval, runTopicManagement, runTopicHeal, setBrokerMode, type ScenarioKey, type SimAction, type EmailSummaryData, type TopicChangePayload, type TopicHealPayload } from "@/lib/client-sim";
 
 export interface MeshClientState {
   agents: AgentState[];
@@ -20,10 +20,14 @@ export interface MeshClientState {
   toasts: { id: number; message: string; kind: string }[];
   particles: { id: string; edgeId: string; fromNode: string; toNode: string; ts: number }[];
   connected: boolean;
+  emailSummary: EmailSummaryData | null;
+  lastEmailSummary: EmailSummaryData | null;
 }
 
+export type { EmailSummaryData, TopicChangePayload, TopicHealPayload };
+
 type Action =
-  | { type: "state"; payload: Omit<MeshClientState, "toasts" | "particles" | "connected" | "auditLog" | "lessons" | "notifications"> & { auditLog?: AuditRecord[]; lessons?: LessonRecord[]; notifications?: NotificationRecord[]; scenarioRunning?: boolean } }
+  | { type: "state"; payload: Omit<MeshClientState, "toasts" | "particles" | "connected" | "auditLog" | "lessons" | "notifications" | "emailSummary"> & { auditLog?: AuditRecord[]; lessons?: LessonRecord[]; notifications?: NotificationRecord[]; scenarioRunning?: boolean } }
   | { type: "audit"; record: AuditRecord }
   | { type: "toast"; message: string; kind: string; id: number }
   | { type: "dismissToast"; id: number }
@@ -31,13 +35,17 @@ type Action =
   | { type: "clearParticle"; id: string }
   | { type: "notification"; record: NotificationRecord }
   | { type: "lesson"; record: LessonRecord }
-  | { type: "connected"; value: boolean };
+  | { type: "connected"; value: boolean }
+  | { type: "emailSummary"; data: EmailSummaryData | null }
+  | { type: "lastEmailSummary"; data: EmailSummaryData | null };
 
 const initial: MeshClientState = {
   agents: [], broker: null, mralPhase: "idle",
   pendingApprovals: [], auditLog: [], lessons: [], notifications: [],
   incidentQueueDepth: 0, scenarioRunning: false,
   toasts: [], particles: [], connected: false,
+  emailSummary: null,
+  lastEmailSummary: null,
 };
 
 function reducer(state: MeshClientState, action: Action): MeshClientState {
@@ -58,6 +66,13 @@ function reducer(state: MeshClientState, action: Action): MeshClientState {
     case "notification": return { ...state, notifications: [...state.notifications.slice(-49), action.record] };
     case "lesson": return { ...state, lessons: [...state.lessons.slice(-19), action.record] };
     case "connected": return { ...state, connected: action.value };
+    case "emailSummary": return {
+      ...state,
+      emailSummary: action.data,
+      // Persist non-null data as lastEmailSummary so it can be re-shown
+      lastEmailSummary: action.data ?? state.lastEmailSummary,
+    };
+    case "lastEmailSummary": return { ...state, emailSummary: action.data };
     default: return state;
   }
 }
@@ -68,6 +83,12 @@ let particleId = 0;
 export function useMeshStream() {
   const [state, dispatch] = useReducer(reducer, initial);
   const esRef = useRef<EventSource | null>(null);
+  // Ref always holds the latest non-null emailSummary so showLastSummary is never stale,
+  // regardless of when in the render cycle the button is clicked.
+  const lastSummaryRef = useRef<EmailSummaryData | null>(null);
+  if (state.emailSummary !== null) {
+    lastSummaryRef.current = state.emailSummary;
+  }
 
   useEffect(() => {
     let retryMs = 1000;
@@ -88,10 +109,19 @@ export function useMeshStream() {
       es.onmessage = (e) => {
         const event = JSON.parse(e.data) as BusEvent & { auditLog?: AuditRecord[]; lessons?: LessonRecord[]; notifications?: NotificationRecord[]; scenarioRunning?: boolean };
         switch (event.type) {
-          case "state":
+          case "state": {
+            // Sync broker mode into client-sim so MRAL scenario steps preserve REAL state.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            dispatch({ type: "state", payload: event as any });
+            const brokerMode = (event as any).broker?.mode;
+            if (brokerMode === "REAL" || brokerMode === "MOCK") setBrokerMode(brokerMode);
+            // Strip pendingApprovals from SSE payloads — approvals are managed
+            // exclusively by client-sim. On localhost the Next.js dev server
+            // retains scenario state across page refreshes in globalThis, so the
+            // SSE stream would replay stale approvals and double-show the gate.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            dispatch({ type: "state", payload: { ...(event as any), pendingApprovals: [] } });
             break;
+          }
           case "audit":
             dispatch({ type: "audit", record: event.record });
             break;
@@ -122,30 +152,60 @@ export function useMeshStream() {
   }, []);
 
   const trigger = async (scenarioId: string) => {
-    // Always run the client-side simulation so Vercel deployments work
-    // (serverless instances don't share globalThis state, so SSE from a
-    // different instance won't carry the server-side events to this client).
+    // The client-side simulation handles ALL visual animation and audit records.
+    // We do NOT also call /api/mesh/scenario because:
+    //   • On localhost  → SSE would deliver server-side events on top of the
+    //     client-sim events, producing duplicate audit log entries.
+    //   • On Vercel     → serverless isolation means the SSE stream and the
+    //     scenario trigger run in different instances; server events never
+    //     arrive anyway, so the double-call is pure noise.
+    // For REAL Kafka mode (actual broker mutations), wire up a separate
+    // "exec-only" endpoint that fires mutations without pushing SSE events.
     runClientScenario(scenarioId as ScenarioKey, dispatch as (a: SimAction) => void);
-
-    // Also notify the server (fires real Kafka mutations when in REAL mode).
-    fetch("/api/mesh/scenario", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: scenarioId }),
-    }).catch(() => { /* server-side fire-and-forget; client sim already running */ });
   };
 
   const approve = async (id: string, decision: "approve" | "reject") => {
-    await fetch("/api/mesh/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, decision }) });
+    // Route the decision into the client-side simulation immediately so the
+    // scenario branches on approve vs reject without waiting for the server.
+    resolvePendingApproval(decision === "approve");
+    // Also notify the server (no-op on Vercel serverless, but keeps real-mode in sync).
+    fetch("/api/mesh/approve", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, decision }) }).catch(() => {});
   };
 
   const agentAction = async (agentId: string, action: "kill" | "restart") => {
-    await fetch("/api/mesh/agent", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agentId, action }) });
+    // Show immediate popup — user shouldn't have to hunt for feedback
+    const id = ++toastId;
+    const agentLabel = agentId.replace("-agent", "");
+    if (action === "kill") {
+      dispatch({ type: "toast", message: `⚰️ ${agentLabel} agent killed — click Restart to resume`, kind: "error", id });
+      setTimeout(() => dispatch({ type: "dismissToast", id }), 7000);
+    } else {
+      dispatch({ type: "toast", message: `✅ ${agentLabel} agent restarted successfully`, kind: "success", id });
+      setTimeout(() => dispatch({ type: "dismissToast", id }), 4500);
+    }
+    fetch("/api/mesh/agent", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agentId, action }) }).catch(() => {});
   };
 
   const reset = async () => {
     await fetch("/api/mesh/reset", { method: "POST" });
   };
 
-  return { state, trigger, approve, agentAction, reset };
+  const dismissEmailSummary = () => dispatch({ type: "emailSummary", data: null });
+
+  const showLastSummary = () => {
+    // Use the ref — never stale, always holds the last non-null emailSummary
+    if (lastSummaryRef.current) {
+      dispatch({ type: "emailSummary", data: lastSummaryRef.current });
+    }
+  };
+
+  const triggerTopicAction = (payload: TopicChangePayload) => {
+    runTopicManagement(payload, dispatch as (a: SimAction) => void);
+  };
+
+  const triggerTopicHeal = (payload: TopicHealPayload, onComplete?: () => void) => {
+    runTopicHeal(payload, dispatch as (a: SimAction) => void, onComplete);
+  };
+
+  return { state, trigger, approve, agentAction, reset, dismissEmailSummary, showLastSummary, triggerTopicAction, triggerTopicHeal };
 }
