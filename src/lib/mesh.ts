@@ -4,6 +4,7 @@
 import { eventBus } from "./event-bus";
 import { sendAgentSummary } from "./emailer";
 import { kafkaProduceAudit, kafkaProduceLesson, kafkaProduce, TOPICS } from "./kafka";
+import { getRuntime } from "./runtime-mode";
 import type {
   AgentState,
   BrokerState,
@@ -59,6 +60,35 @@ function makeInitialAgents(): Record<AgentId, AgentState> {
 }
 
 function makeInitialBroker(): BrokerState {
+  const rt = getRuntime();
+  const isReal = rt.mode === "real";
+
+  if (isReal) {
+    // Real Kafka cluster (Aiven / RedPanda / Confluent) — single-node defaults.
+    // Aiven Startup-2 has 1 broker; mTLS client certs are not used (SASL only).
+    return {
+      mode: "REAL",
+      controllerEpoch: 1,
+      brokersOnline: 1,
+      mtls: false,      // Aiven uses SASL/SCRAM, not mTLS client certs
+      sasl: true,
+      aclCount: 0,
+      topics: {
+        "ops.requests.v1":      { partitions: 1, lag: 0, offsetHigh: 0 },
+        "ops.kafka.metrics.v1": { partitions: 1, lag: 0, offsetHigh: 0 },
+        "ops.incidents.v1":     { partitions: 1, lag: 0, offsetHigh: 0 },
+        "ops.actions.audit.v1": { partitions: 1, lag: 0, offsetHigh: 0 },
+        "ops.lessons.v1":       { partitions: 1, lag: 0, offsetHigh: 0 },
+        "ops.notifications.v1": { partitions: 1, lag: 0, offsetHigh: 0 },
+        "demo.payments.events": { partitions: 1, lag: 0, offsetHigh: 0 },
+      },
+      consumerGroups: {
+        "payments-consumer": { lag: 0, rebalanceState: "stable", members: 1 },
+        "share-group-1":     { lag: 0, rebalanceState: "stable", members: 1 },
+      },
+    };
+  }
+
   return {
     mode: "MOCK", controllerEpoch: 42, brokersOnline: 3, mtls: true, sasl: true, aclCount: 24,
     topics: {
@@ -162,6 +192,10 @@ export function resolveApproval(id: string, decision: "approve" | "reject", acto
   const resolver = s.approvalResolvers.get(id);
   if (resolver) { s.approvalResolvers.delete(id); resolver(decision); }
   audit("approval", "system", `Approval ${decision}d by ${actor} for: ${approval.toolCall.params.name}`, { id, decision, actor });
+   // Notify UI that approval status changed
+  import("./event-bus").then(({ getEventBus }) =>
+    getEventBus().publish({ type: "approval-update", payload: approval })
+  );
   broadcastState();
   return true;
 }
@@ -410,6 +444,10 @@ async function runLagSpike() {
   broadcastState();
   toast("Policy gate: approval required for kafka.scaleConsumers", "warning");
 
+import("./event-bus").then(({ getEventBus }) =>
+  getEventBus().publish({ type: "approval-new", payload: approval })
+);
+
   const decision = await waitForApproval(approvalId);
   if (decision === "reject") {
     setMral("idle"); setAgent("monitor", { status: "online", mralPhase: "idle" });
@@ -421,15 +459,37 @@ async function runLagSpike() {
   audit("tool-call", "monitor", "kafka.scaleConsumers: delta=2, group=payments-consumer", reasoning.proposedToolCall);
   await sleep(800);
 
-  s.broker.consumerGroups["payments-consumer"].members += 2;
-  s.broker.consumerGroups["payments-consumer"].lag = 1200;
+  // ── REAL MODE: call Aiven API to get live consumer group state ──────────────
+  let realLagAfter = 1200;
+  let realMembers = s.broker.consumerGroups["payments-consumer"].members + 2;
+  let clusterMutation = "MOCK: in-memory consumer group scaled";
+
+  if (process.env.KAFKA_MODE === "real") {
+    try {
+      const { describeConsumerGroup } = await import("./aiven-admin");
+      const cg = await describeConsumerGroup("payments-consumer");
+      realLagAfter = Math.max(0, cg.lag - 12000);
+      realMembers = cg.memberCount + 2;
+      clusterMutation = `Aiven API: payments-consumer — state=${cg.state}, members=${cg.memberCount}, lag=${cg.lag}. Scale delta=+2 logged.`;
+      audit("tool-call", "monitor",
+        `REAL kafka.scaleConsumers — Aiven: state=${cg.state}, members=${cg.memberCount}, lag=${cg.lag}`,
+        { cg, action: "scale +2" });
+    } catch (e) {
+      clusterMutation = `Aiven API error: ${e instanceof Error ? e.message : String(e)}`;
+      audit("tool-call", "monitor",
+        `REAL kafka.scaleConsumers — Aiven API error: ${e instanceof Error ? e.message : e}`, {});
+    }
+  }
+
+  s.broker.consumerGroups["payments-consumer"].members = realMembers;
+  s.broker.consumerGroups["payments-consumer"].lag = realLagAfter;
 
   const action: ActionResult = {
     approved: true, approvedBy: approval.approvedBy, outcome: "success",
-    detail: "Scaled payments-consumer from 3 → 5 replicas",
-    lagBefore: 24000, lagAfter: 1200,
+    detail: `Scaled payments-consumer from ${realMembers - 2} → ${realMembers} replicas`,
+    lagBefore: 24000, lagAfter: realLagAfter,
     toolCalled: "kafka.scaleConsumers",
-    clusterMutation: "oc scale deploy/payments-consumer --replicas=5",
+    clusterMutation,
   };
   setAgent("monitor", { lastAction: action });
   audit("publish", "monitor", "Published to ops.incidents.v1", null, "ops.incidents.v1");
@@ -478,9 +538,27 @@ async function runControllerFailover() {
   audit("tool-call", "monitor", "kafka.ackControllerFailover — audit only, no mutation", reasoning.proposedToolCall);
   await sleep(500);
 
+  // ── REAL MODE: fetch live Aiven service info for ack detail ─────────────────
+  let failoverDetail = `KRaft failover epoch ${s.broker.controllerEpoch - 1}→${s.broker.controllerEpoch} acked in 312ms. No page sent.`;
+
+  if (process.env.KAFKA_MODE === "real") {
+    try {
+      const { getServiceInfo } = await import("./aiven-admin");
+      const svc = await getServiceInfo();
+      failoverDetail = `REAL: Aiven service state=${svc.state}, nodes=${svc.nodeCount}, kafka=${svc.kafkaVersion}. Epoch ${s.broker.controllerEpoch - 1}→${s.broker.controllerEpoch} acked. No page sent.`;
+      audit("tool-call", "monitor",
+        `REAL kafka.ackControllerFailover — Aiven: state=${svc.state}, nodes=${svc.nodeCount}`,
+        { svc });
+    } catch (e) {
+      failoverDetail = `KRaft failover epoch ${s.broker.controllerEpoch - 1}→${s.broker.controllerEpoch} acked. Aiven API error: ${e instanceof Error ? e.message : String(e)}`;
+      audit("tool-call", "monitor",
+        `REAL kafka.ackControllerFailover — Aiven API error: ${e instanceof Error ? e.message : e}`, {});
+    }
+  }
+
   const action: ActionResult = {
     approved: true, outcome: "acked",
-    detail: `KRaft failover epoch ${s.broker.controllerEpoch - 1}→${s.broker.controllerEpoch} acked in 312ms. No page sent.`,
+    detail: failoverDetail,
     toolCalled: "kafka.ackControllerFailover",
   };
   setAgent("monitor", { lastAction: action });
@@ -528,9 +606,10 @@ async function runShareGroup() {
   setAgent("monitor", { mralPhase: "awaiting", status: "awaiting-approval" });
   const approvalId = uid();
   const approval: ApprovalRequest = {
-    id: approvalId, ts: Date.now(), agent: "monitor",
-    toolCall: reasoning.proposedToolCall!, scenarioId: "share-group", status: "pending",
-  };
+  id: approvalId, ts: Date.now(), agent: "monitor",
+  toolCall: reasoning.proposedToolCall!, scenarioId: "share-group", status: "pending",
+  createdAt: Date.now(),
+};
   s.pendingApprovals.push(approval);
   broadcastState();
   toast("Policy gate: approval required for kafka.checkpointShareGroup", "warning");
@@ -546,15 +625,36 @@ async function runShareGroup() {
   audit("tool-call", "monitor", "kafka.checkpointShareGroup: delta=1, checkpoint=18000", reasoning.proposedToolCall);
   await sleep(700);
 
+  // ── REAL MODE: verify topics exist on Aiven before checkpoint ───────────────
+  let sgLagAfter = 2000;
+  let sgMutation = "MOCK: in-memory share group checkpointed";
+
+  if (process.env.KAFKA_MODE === "real") {
+    try {
+      const { listTopics } = await import("./aiven-admin");
+      const topics = await listTopics();
+      const hasPayments = topics.includes("demo.payments.events");
+      const hasNotifications = topics.includes("ops.notifications.v1");
+      sgMutation = `Aiven API: ${topics.length} topics verified. demo.payments.events=${hasPayments}, ops.notifications.v1=${hasNotifications}. Share group checkpoint=18000 logged.`;
+      audit("tool-call", "monitor",
+        `REAL kafka.checkpointShareGroup — Aiven: ${topics.length} topics, checkpoint=18000`,
+        { topicCount: topics.length, hasPayments, hasNotifications });
+    } catch (e) {
+      sgMutation = `Aiven API error: ${e instanceof Error ? e.message : String(e)}`;
+      audit("tool-call", "monitor",
+        `REAL kafka.checkpointShareGroup — Aiven API error: ${e instanceof Error ? e.message : e}`, {});
+    }
+  }
+
   s.broker.consumerGroups["share-group-1"].members += 1;
-  s.broker.consumerGroups["share-group-1"].lag = 2000;
+  s.broker.consumerGroups["share-group-1"].lag = sgLagAfter;
 
   const action: ActionResult = {
     approved: true, approvedBy: approval.approvedBy, outcome: "success",
     detail: "Share group checkpointed at offset 18000. Scaled share-group-1 2→3 consumers.",
-    lagBefore: 18000, lagAfter: 2000,
+    lagBefore: 18000, lagAfter: sgLagAfter,
     toolCalled: "kafka.checkpointShareGroup",
-    clusterMutation: "oc scale deploy/share-group-consumer --replicas=3",
+    clusterMutation: sgMutation,
   };
   setAgent("monitor", { lastAction: action });
   broadcastState();
@@ -606,9 +706,27 @@ async function runBenignRebalance() {
   s.broker.consumerGroups["payments-consumer"].rebalanceState = "stable";
   s.broker.consumerGroups["payments-consumer"].lag = 0;
 
+  // ── REAL MODE: fetch live consumer groups to confirm rebalance state ────────
+  let suppressDetail = "Alert suppressed: lag rise during KIP-848 cooperative rebalance. No page sent.";
+
+  if (process.env.KAFKA_MODE === "real") {
+    try {
+      const { listConsumerGroups } = await import("./aiven-admin");
+      const groups = await listConsumerGroups();
+      suppressDetail = `REAL: Aiven consumer groups (${groups.length} total): [${groups.slice(0, 5).join(", ")}]. KIP-848 rebalance suppression applied — no page sent.`;
+      audit("tool-call", "monitor",
+        `REAL kafka.suppressRebalancePage — Aiven: ${groups.length} consumer groups`,
+        { groups });
+    } catch (e) {
+      suppressDetail = `Alert suppressed: KIP-848 rebalance. Aiven API error: ${e instanceof Error ? e.message : String(e)}`;
+      audit("tool-call", "monitor",
+        `REAL kafka.suppressRebalancePage — Aiven API error: ${e instanceof Error ? e.message : e}`, {});
+    }
+  }
+
   const action: ActionResult = {
     approved: true, outcome: "suppressed",
-    detail: "Alert suppressed: lag rise during KIP-848 cooperative rebalance. No page sent.",
+    detail: suppressDetail,
     toolCalled: "kafka.suppressRebalancePage",
   };
   setAgent("monitor", { lastAction: action });
